@@ -1,0 +1,340 @@
+name: Build Horizon Launcher (Offline)
+
+# Builds a fork of horizon-rust/horizon that plays offline WITHOUT a Microsoft
+# account that owns Minecraft: Java Edition. The build:
+#   1. Checks out THIS repo (which carries only the patch script + workflows).
+#   2. Clones horizon-rust/horizon@<ref> with --depth 1 (latest by default).
+#   3. Applies the surgical offline patches from ./horizon-offline-patch/.
+#   4. Builds `cargo build --release --locked` for Linux x86_64 and Windows x64.
+#   5. Zips each platform's binary (+ deps / README) into a .zip artifact and
+#      publishes a GitHub Release.
+#
+# Online play is NOT removed: a user who signs in with a Microsoft account that
+# owns Minecraft: Java Edition still gets a real session token, real skin, and
+# can join online servers. The owner gate is simply no longer required to start
+# the game.
+
+on:
+  workflow_dispatch:
+    inputs:
+      horizon_ref:
+        description: 'Branch, tag or commit SHA of horizon-rust/horizon to clone and build'
+        required: true
+        default: 'main'
+        type: string
+      dry_run:
+        description: 'Build only, do NOT publish a GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+  watch:
+    types: [started]
+
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflows/build-horizon-launcher.yml'
+      - 'horizon-offline-patch/**'
+      - 'README.md'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: horizon-launcher-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Disables telemetry in CI/test runs (matches upstream).
+  HORIZON_TELEMETRY_URL: "off"
+  # Default ref when the workflow runs from push/watch (no `inputs.horizon_ref`):
+  # use the upstream's main branch. workflow_dispatch overrides this via inputs.
+  HORIZON_REF_DEFAULT: "main"
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: horizon-launcher
+            asset_name: horizon-launcher-offline-linux-x86_64
+            archive_ext: zip
+            rustflags: ''
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: horizon-launcher.exe
+            asset_name: horizon-launcher-offline-windows-x86_64
+            archive_ext: zip
+            # Match upstream's launcher.yml: statically link the C runtime so
+            # the .exe does not need the Visual C++ Redistributable on the
+            # player's machine.
+            rustflags: '-C target-feature=+crt-static'
+
+    steps:
+      # ─────────────────────────────────────────────────────────────────────
+      # 1. Checkout THIS repo (so we have horizon-offline-patch/).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 1. Checkout this repo (patches + workflow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 2. Clone horizon-rust/horizon with --depth 1 (latest commit on ref).
+      #    Handles three ref shapes: branch name, tag, and commit SHA. The
+      #    `--branch` flag works for branches and tags; for commit SHAs we fall
+      #    back to `git fetch --depth 1 origin <sha>` then `checkout FETCH_HEAD`.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 2. Clone horizon-rust/horizon@${{ inputs.horizon_ref || 'main' }}
+        env:
+          REF: ${{ inputs.horizon_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          echo "Cloning horizon-rust/horizon at ref: $REF"
+          if git clone --depth 1 --branch "$REF" \
+              https://github.com/horizon-rust/horizon.git horizon 2>/tmp/clone.err; then
+            echo "Cloned with --branch $REF"
+          else
+            echo "--branch clone failed (likely a commit SHA). Falling back to fetch + checkout."
+            cat /tmp/clone.err || true
+            rm -rf horizon
+            git init horizon
+            cd horizon
+            git remote add origin https://github.com/horizon-rust/horizon.git
+            git fetch --depth 1 origin "$REF"
+            git checkout FETCH_HEAD
+          fi
+        shell: bash
+
+      - name: Show cloned horizon HEAD
+        run: |
+          cd horizon
+          echo "## Horizon HEAD" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          git log -1 --format='commit %H%nAuthor: %an <%ae>%nDate  : %ad%nSubject: %s'
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        shell: bash
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 3. Apply the offline patches.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 3. Apply offline patches
+        run: |
+          python3 horizon-offline-patch/apply_patches.py "$(pwd)/horizon" --verify
+          python3 horizon-offline-patch/apply_patches.py "$(pwd)/horizon"
+        shell: bash
+
+      - name: 3b. Show patched diff
+        run: |
+          cd horizon
+          git --no-pager diff --stat
+        shell: bash
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 4. Setup Rust toolchain (stable, matches upstream's CI).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 4. Setup Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 4b. Rust cache (Swatinem/rust-cache)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: horizon/launcher
+          key: ${{ matrix.name }}-${{ inputs.horizon_ref || 'main' }}
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 5. Install Linux system libraries GPUI links to (Linux only).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 5. Install Linux system libraries (GPUI / wgpu / ALSA)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libfontconfig-dev libvulkan-dev libasound2-dev \
+            patchelf pkg-config
+        shell: bash
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 6. Build the launcher in release mode (locked deps).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 6. Build the launcher (cargo build --release --locked)
+        run: |
+          cd horizon/launcher
+          cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        env:
+          # Build-time env (matches upstream's launcher.yml):
+          # - MSA client id left unset: the patch makes it irrelevant.
+          # - Telemetry off.
+          # - RUSTFLAGS per-matrix (Windows: static CRT).
+          HORIZON_TELEMETRY_URL: "off"
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 7. Stage the binary + a runtime README into a clean staging dir.
+      #    On Linux we ALSO try the upstream AppImage packaging script
+      #    (packaging/linux/appimage.sh): if it succeeds, the AppImage is the
+      #    primary artifact (single-file, bundles its libs, easier to ship).
+      #    If it fails (e.g. no FUSE, no appimagetool), we ship the bare
+      #    binary + a runtime README that lists the apt deps to install.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: "7. Stage artifacts (Linux: binary + try AppImage)"
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="${{ github.workspace }}/stage"
+          mkdir -p "$STAGE"
+
+          BIN_SRC="horizon/launcher/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [ ! -f "$BIN_SRC" ]; then
+            echo "FATAL: built binary not found at $BIN_SRC"
+            ls -la horizon/launcher/target/${{ matrix.target }}/release/ || true
+            exit 1
+          fi
+          cp "$BIN_SRC" "$STAGE/"
+
+          cp horizon-offline-patch/README.md "$STAGE/OFFLINE-PATCH-README.md"
+          cp -r horizon-offline-patch "$STAGE/horizon-offline-patch-source"
+          cp horizon/README.md "$STAGE/HORIZON-UPSTREAM-README.md" 2>/dev/null || true
+
+          # Try the upstream AppImage script. If it fails, continue with the
+          # bare binary; the player can install the libs from apt.
+          VERSION=$(grep '^version' horizon/launcher/Cargo.toml | head -1 | sed 's/.*= *"\(.*\)".*/\1/')
+          echo "Detected launcher version: $VERSION"
+          if (cd horizon && bash packaging/linux/appimage.sh "$STAGE/${{ matrix.binary }}" "$VERSION" "$STAGE"); then
+            echo "AppImage build succeeded."
+            ls -lh "$STAGE/"*.AppImage || true
+          else
+            echo "AppImage build FAILED. Shipping bare binary + a deps README."
+            cat > "$STAGE/INSTALL-LINUX-DEPS.sh" <<'EOF'
+          #!/bin/sh
+          # Installs the shared libraries the horizon-launcher binary links to
+          # on Debian/Ubuntu. Run once before launching the binary.
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-x11-0 libwayland-client0 libx11-xcb1 \
+            libfontconfig1 libvulkan1 libasound2t64
+          echo "Dependencies installed. You can now run ./horizon-launcher"
+          EOF
+            chmod +x "$STAGE/INSTALL-LINUX-DEPS.sh"
+          fi
+          ls -la "$STAGE"
+
+      - name: "7b. Stage artifacts (Windows: binary + DLLs we can find + README)"
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="${{ github.workspace }}/stage"
+          mkdir -p "$STAGE"
+
+          BIN_SRC="horizon/launcher/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [ ! -f "$BIN_SRC" ]; then
+            echo "FATAL: built binary not found at $BIN_SRC"
+            ls -la horizon/launcher/target/${{ matrix.target }}/release/ || true
+            exit 1
+          fi
+          cp "$BIN_SRC" "$STAGE/"
+
+          # Copy any sibling DLLs the linker produced (e.g. webview2loader).
+          cp horizon/launcher/target/${{ matrix.target }}/release/*.dll "$STAGE/" 2>/dev/null || true
+
+          cp horizon-offline-patch/README.md "$STAGE/OFFLINE-PATCH-README.md"
+          cp -r horizon-offline-patch "$STAGE/horizon-offline-patch-source"
+          cp horizon/README.md "$STAGE/HORIZON-UPSTREAM-README.md" 2>/dev/null || true
+
+          ls -la "$STAGE"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 8. Create the .zip / .tar.gz archive.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 8. Archive (zip on Windows, tar.gz on Linux)
+        uses: thedoctor0/zip-release@0.7.6
+        with:
+          type: ${{ matrix.archive_ext }}
+          directory: stage
+          filename: ${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+          path: .
+          exclusions: '*.git*'
+
+      - name: 8b. Show archive info
+        run: ls -lh stage/*.${{ matrix.archive_ext }}
+        shell: bash
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 9. Upload as a workflow artifact (30 days).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 9. Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: stage/${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 10. Publish to GitHub Releases (skipped on dry_run).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: 10. Publish to GitHub Releases
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: offline-${{ matrix.name }}-${{ github.run_id }}
+          name: "Horizon Launcher (Offline) — ${{ matrix.name }} (run #${{ github.run_number }})"
+          body: |
+            ## Horizon Launcher — Offline build
+
+            - **Upstream:** `horizon-rust/horizon`
+            - **Ref built:** `${{ inputs.horizon_ref || 'main' }}`
+            - **Patch set:** `./horizon-offline-patch/` (9 surgical source edits, no API rewrites)
+            - **Target:** `${{ matrix.target }}`
+            - **Build commit:** `${{ github.sha }}`
+
+            ### What this build does
+            Plays Minecraft: Java Edition **offline without a Microsoft account**,
+            on the very first run. Online play still works if you sign in with a
+            Microsoft account that owns the game.
+
+            ### Files
+            - `${{ matrix.asset_name }}.${{ matrix.archive_ext }}` — the launcher binary + README + patch source.
+
+            See the in-repo `horizon-offline-patch/README.md` for the full list
+            of patches and how to verify them.
+          files: |
+            stage/${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+          fail_on_unmatched_files: true
+          prerelease: false
+
+  summary:
+    name: Build summary
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Summarise build matrix
+        run: |
+          echo "## Horizon launcher build results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Overall build job result: **${{ needs.build.result }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Each platform's status is visible in the matrix jobs above (linux-x86_64, windows-x86_64)." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Ref built: \`${{ inputs.horizon_ref || 'main' }}\`" >> $GITHUB_STEP_SUMMARY
+        shell: bash
