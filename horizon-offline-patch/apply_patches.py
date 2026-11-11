@@ -741,6 +741,491 @@ def patch_place_staged_hard_guard(src: str) -> tuple[str, str]:
 
 
 # ============================================================================
+# Group 5 - Offline account name (re-add what upstream removed)
+# ============================================================================
+#
+# Upstream's Nov 10 2026 refactor (generation B) removed the offline-names
+# feature ENTIRELY: the `Player::Offline` enum variant, the `add_offline`
+# method, the `offline` field on `Accounts`, and every UI element that let a
+# player type a name and play without a Microsoft account.
+#
+# The patches above (Group 1) bypass the owner GATE so the game starts, but
+# they do NOT re-add the ability to pick an offline name. Without these
+# patches, the game starts with a name the player cannot control (and on
+# generation B, `java_player()` returns Err(NoOwner) because it calls
+# `launch()` directly, not `launch_for_game` -- the game never starts at all).
+#
+# Group 5 closes that gap:
+#
+#   018: Settings gains an `offline_name: Option<String>` field + a helper
+#        that returns the name or "Player".
+#   019: account.rs gains `offline_player(name)` and `offline_uuid(name)`:
+#        a deterministic UUID from the name (SHA-1 based, so no new crate).
+#   020: `java_player_with` falls back to `offline_player` when `launch()`
+#        returns NoOwner -- the game starts with the player's chosen name.
+#   021: Launcher state: `offline_name_input` (a LineEdit), focus tracking,
+#        and a `save_offline_name` method.
+#   022: The Account settings page (glass_account.rs) gains a text input +
+#        Save button below the Microsoft card.
+#   023: `glass_who_plays` shows the offline name when no Microsoft account
+#        is selected (instead of "Sign in with Microsoft").
+#   024: The top bar's `who_plays` (switch_page.rs) shows the offline name
+#        too, so the chip reads the player's name, not an empty string.
+
+
+def patch_settings_offline_name_field(src: str) -> tuple[str, str]:
+    """018: backend.rs -- Settings gains an `offline_name` field + helper.
+
+    The field is `Option<String>`: None means "Player" (the game's default
+    offline name). The helper `offline_name()` returns the name or "Player".
+    """
+    # Step 1: add the field after `owner_notice_seen`.
+    field_needle = (
+        "    /// The player without an account that owns the game has read, once, why the launcher needs\n"
+        "    /// one now (the owner gate's screen).\n"
+        "    #[serde(default)]\n"
+        "    pub owner_notice_seen: bool,\n"
+    )
+    field_replacement = (
+        "    /// The player without an account that owns the game has read, once, why the launcher needs\n"
+        "    /// one now (the owner gate's screen).\n"
+        "    #[serde(default)]\n"
+        "    pub owner_notice_seen: bool,\n"
+        "    /// [horizon-offline-patch] The name the game plays under when no Microsoft account\n"
+        "    /// that owns the game is signed in. None means \"Player\". Set on the Account\n"
+        "    /// settings page; the game starts offline with this name on the first run.\n"
+        "    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n"
+        "    pub offline_name: Option<String>,\n"
+    )
+    if field_replacement in src:
+        pass  # already applied
+    elif field_needle not in src:
+        return src, "missing"
+    else:
+        src = src.replace(field_needle, field_replacement, 1)
+
+    # Step 2: add the helper method after `auto_install`.
+    helper_needle = (
+        "    /// Whether new Horizon versions are installed automatically.\n"
+        "    pub fn auto_install(&self) -> bool {\n"
+        "        self.install_new_versions.unwrap_or(true)\n"
+        "    }\n"
+    )
+    helper_replacement = (
+        "    /// Whether new Horizon versions are installed automatically.\n"
+        "    pub fn auto_install(&self) -> bool {\n"
+        "        self.install_new_versions.unwrap_or(true)\n"
+        "    }\n"
+        "    /// [horizon-offline-patch] The name the game plays under offline (no Microsoft\n"
+        "    /// account that owns the game). Returns the player's chosen name, or \"Player\"\n"
+        "    /// when none is set or the name is blank.\n"
+        "    pub fn offline_name(&self) -> String {\n"
+        "        self.offline_name\n"
+        "            .clone()\n"
+        "            .map(|n| n.trim().to_string())\n"
+        "            .filter(|n| !n.is_empty())\n"
+        "            .unwrap_or_else(|| \"Player\".to_string())\n"
+        "    }\n"
+    )
+    if helper_replacement in src:
+        return src, "already"
+    if helper_needle not in src:
+        return src, "missing"
+    src = src.replace(helper_needle, helper_replacement, 1)
+    return src, "applied"
+
+
+def patch_account_offline_player_fn(src: str) -> tuple[str, str]:
+    """019: account.rs -- add `offline_player(name)` and `offline_uuid(name)`.
+
+    `offline_player` builds a `java_launch::Player` with the given name, a
+    deterministic UUID derived from it, no token, and no xuid. The game
+    starts offline with this player when no Microsoft account owns the game.
+
+    `offline_uuid` hashes `b"OfflinePlayer:" + name` with SHA-1 (the crate
+    the launcher already depends on), takes the first 16 bytes, and sets
+    the version (3, name-based) and variant (IETF) bits. The result is a
+    valid UUID v3 that is stable per name (single-player saves stick).
+    """
+    # The needle is the start of `java_player_with`; we insert the two new
+    # functions right before it.
+    needle = "fn java_player_with(\n"
+    replacement = (
+        "/// [horizon-offline-patch] An offline player: the name the player chose\n"
+        "/// (Settings' `offline_name`, or \"Player\"), a deterministic UUID derived from\n"
+        "/// it, and no token. The game starts offline with this player when no Microsoft\n"
+        "/// account that owns the game is signed in.\n"
+        "pub fn offline_player(name: &str) -> crate::java_launch::Player {\n"
+        "    crate::java_launch::Player {\n"
+        "        name: name.to_string(),\n"
+        "        uuid: offline_uuid(name),\n"
+        "        token: String::new(),\n"
+        "        xuid: String::new(),\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "/// [horizon-offline-patch] A deterministic UUID from a player name, the way\n"
+        "/// Mojang's game derives its offline UUIDs: a type-3 (name-based) UUID. Mojang\n"
+        "/// uses MD-5; we use SHA-1 (the crate the launcher already depends on for\n"
+        "/// `heads` and `sources`), so the exact bytes differ from the game's own offline\n"
+        "/// UUID -- but the UUID is stable per name, so single-player saves stick.\n"
+        "fn offline_uuid(name: &str) -> String {\n"
+        "    use sha1::{Digest, Sha1};\n"
+        "    let mut hasher = Sha1::new();\n"
+        "    hasher.update(b\"OfflinePlayer:\");\n"
+        "    hasher.update(name.as_bytes());\n"
+        "    let hash = hasher.finalize();\n"
+        "    let mut bytes = [0u8; 16];\n"
+        "    bytes.copy_from_slice(&hash[..16]);\n"
+        "    // Set the version (3, name-based) and variant (IETF) bits.\n"
+        "    bytes[6] = (bytes[6] & 0x0F) | 0x30;\n"
+        "    bytes[8] = (bytes[8] & 0x3F) | 0x80;\n"
+        "    format!(\n"
+        "        \"{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\",\n"
+        "        bytes[0], bytes[1], bytes[2], bytes[3],\n"
+        "        bytes[4], bytes[5], bytes[6], bytes[7],\n"
+        "        bytes[8], bytes[9], bytes[10], bytes[11],\n"
+        "        bytes[12], bytes[13], bytes[14], bytes[15]\n"
+        "    )\n"
+        "}\n"
+        "\n"
+        "fn java_player_with(\n"
+    )
+    # Idempotency: if the new function is already there, skip.
+    if "pub fn offline_player(name: &str) -> crate::java_launch::Player {" in src:
+        return src, "already"
+    if needle not in src:
+        return src, "missing"
+    return src.replace(needle, replacement, 1), "applied"
+
+
+def patch_java_player_with_offline_fallback(src: str) -> tuple[str, str]:
+    """020: account.rs -- java_player_with falls back to offline_player.
+
+    When `launch()` returns `Err(NoOwner)` (no account owns the game), the
+    function returns `Ok(offline_player(name))` instead of propagating the
+    error. The name comes from Settings' `offline_name()` (or "Player").
+    """
+    needle = (
+        "    let pass = launch(ep, client_id, store, accounts).map_err(|e| e.to_string())?;\n"
+        "    let kept = || {\n"
+    )
+    replacement = (
+        "    let pass = match launch(ep, client_id, store, accounts) {\n"
+        "        Ok(pass) => pass,\n"
+        "        Err(_no_owner) => {\n"
+        "            // [horizon-offline-patch] No account owns the game: play\n"
+        "            // offline with the player's chosen name (Settings'\n"
+        "            // `offline_name`, or \"Player\"). The game starts without\n"
+        "            // a session token; single-player and offline servers work.\n"
+        "            let name = crate::backend::Settings::load().offline_name();\n"
+        "            return Ok(offline_player(&name));\n"
+        "        }\n"
+        "    };\n"
+        "    let kept = || {\n"
+    )
+    if "// [horizon-offline-patch] No account owns the game: play" in src:
+        return src, "already"
+    if needle not in src:
+        return src, "missing"
+    return src.replace(needle, replacement, 1), "applied"
+
+
+def patch_launcher_offline_name_state(src: str) -> tuple[str, str]:
+    """021: main.rs -- add offline_name LineEdit state, focus, init, save method.
+
+    Three edits in one patch:
+      a) Add the three fields (offline_name_input, offline_name_focused,
+         offline_name_focus) to the Launcher struct, after friend_code.
+      b) Initialize them in `Launcher::new`.
+      c) Track focus in the render loop (where friend_focused is updated).
+      d) Add the `save_offline_name` method after `save_settings`.
+    """
+    # Idempotency: if the fields are already there, skip.
+    if "offline_name_input: line_edit::LineEdit" in src:
+        return src, "already"
+
+    # (a) Add the fields after `friend_focus: FocusHandle,`.
+    fields_needle = (
+        "    friend_code: line_edit::LineEdit,\n"
+        "    friend_focused: bool,\n"
+        "    friend_focus: FocusHandle,\n"
+    )
+    fields_replacement = (
+        "    friend_code: line_edit::LineEdit,\n"
+        "    friend_focused: bool,\n"
+        "    friend_focus: FocusHandle,\n"
+        "    /// [horizon-offline-patch] The offline name input on the Account settings page.\n"
+        "    offline_name_input: line_edit::LineEdit,\n"
+        "    offline_name_focused: bool,\n"
+        "    offline_name_focus: FocusHandle,\n"
+    )
+    if fields_needle not in src:
+        return src, "missing"
+    src = src.replace(fields_needle, fields_replacement, 1)
+
+    # (b) Initialize the fields in `new`.
+    init_needle = (
+        "            friend_focus: cx.focus_handle(),\n"
+        "            joining: None,\n"
+    )
+    init_replacement = (
+        "            friend_focus: cx.focus_handle(),\n"
+        "            // [horizon-offline-patch] The offline name input.\n"
+        "            offline_name_input: line_edit::LineEdit::new(\n"
+        "                settings.offline_name(),\n"
+        "                64,\n"
+        "                32,\n"
+        "            ),\n"
+        "            offline_name_focused: false,\n"
+        "            offline_name_focus: cx.focus_handle(),\n"
+        "            joining: None,\n"
+    )
+    if init_needle not in src:
+        return src, "missing"
+    src = src.replace(init_needle, init_replacement, 1)
+
+    # (c) Track focus in the render loop.
+    focus_needle = "        self.friend_focused = self.friend_focus.is_focused(window);\n"
+    focus_replacement = (
+        "        self.friend_focused = self.friend_focus.is_focused(window);\n"
+        "        self.offline_name_focused = self.offline_name_focus.is_focused(window);\n"
+    )
+    if focus_needle not in src:
+        return src, "missing"
+    src = src.replace(focus_needle, focus_replacement, 1)
+
+    # (d) Add the save_offline_name method after save_settings.
+    save_needle = (
+        "    /// Keeps the current choices in memory if writing fails; every page offers the same retry.\n"
+        "    fn save_settings(&mut self) -> bool {\n"
+        "        self.settings_save_error = self.settings.save().err();\n"
+        "        self.settings_save_error.is_none()\n"
+        "    }\n"
+    )
+    save_replacement = (
+        "    /// Keeps the current choices in memory if writing fails; every page offers the same retry.\n"
+        "    fn save_settings(&mut self) -> bool {\n"
+        "        self.settings_save_error = self.settings.save().err();\n"
+        "        self.settings_save_error.is_none()\n"
+        "    }\n"
+        "\n"
+        "    /// [horizon-offline-patch] Saves the offline name typed in the Account settings\n"
+        "    /// page: trims it, falls back to None (which reads as \"Player\") when empty,\n"
+        "    /// writes it to settings, syncs the input, and saves.\n"
+        "    fn save_offline_name(&mut self) {\n"
+        "        let name = self.offline_name_input.text().trim().to_string();\n"
+        "        self.settings.offline_name = if name.is_empty() { None } else { Some(name) };\n"
+        "        // Keep the input in sync with what was saved (trim + default).\n"
+        "        self.offline_name_input.set(self.settings.offline_name());\n"
+        "        self.save_settings();\n"
+        "    }\n"
+    )
+    if save_needle not in src:
+        return src, "missing"
+    src = src.replace(save_needle, save_replacement, 1)
+
+    return src, "applied"
+
+
+def patch_glass_account_offline_input(src: str) -> tuple[str, str]:
+    """022: glass_account.rs -- add the offline name input below the Microsoft card.
+
+    Two edits:
+      a) In `glass_microsoft_card`, bind `offline_section` before the div chain.
+      b) Append `.child(offline_section)` before the closing `}`.
+      c) Add the `glass_offline_name_input` method at the end of the impl.
+    """
+    if "fn glass_offline_name_input" in src:
+        return src, "already"
+
+    # (a) Add the `let offline_section = ...` binding before the button.
+    button_needle = (
+        '        let button: Option<AnyElement> = if configured && idle && self.sign_in_target.is_none() {\n'
+    )
+    button_replacement = (
+        '        // [horizon-offline-patch] The offline name input, shown below the Microsoft card.\n'
+        '        let offline_section = self.glass_offline_name_input(cx);\n'
+        '        let button: Option<AnyElement> = if configured && idle && self.sign_in_target.is_none() {\n'
+    )
+    if button_needle not in src:
+        return src, "missing"
+    src = src.replace(button_needle, button_replacement, 1)
+
+    # (b) Append `.child(offline_section)` before the method's closing `}`.
+    close_needle = (
+        '            .when(configured, |d| {\n'
+        '                d.child(\n'
+        '                    ui::text(12., FontWeight::NORMAL, 0.45)\n'
+        '                        .mt(px(12.))\n'
+        '                        .line_height(px(18.))\n'
+        '                        .child(tr(\n'
+        '                            "Microsoft\'s own page opens in your browser. Horizon never sees your \\\n'
+        '                             password.",\n'
+        '                        )),\n'
+        '                )\n'
+        '            })\n'
+        '    }\n'
+        '}\n'
+    )
+    close_replacement = (
+        '            .when(configured, |d| {\n'
+        '                d.child(\n'
+        '                    ui::text(12., FontWeight::NORMAL, 0.45)\n'
+        '                        .mt(px(12.))\n'
+        '                        .line_height(px(18.))\n'
+        '                        .child(tr(\n'
+        '                            "Microsoft\'s own page opens in your browser. Horizon never sees your \\\n'
+        '                             password.",\n'
+        '                        )),\n'
+        '                )\n'
+        '            })\n'
+        '            .child(offline_section)\n'
+        '    }\n'
+        '\n'
+        '    /// [horizon-offline-patch] The offline name input: type a name, press Enter or\n'
+        '    /// Save, and the game plays under that name when no Microsoft account that owns\n'
+        '    /// the game is signed in.\n'
+        '    fn glass_offline_name_input(&mut self, cx: &mut Context<Self>) -> Div {\n'
+        '        let t = self.theme;\n'
+        '        let focused = self.offline_name_focused;\n'
+        '        let current = self.settings.offline_name();\n'
+        '        let label = ui::text(13., FontWeight::MEDIUM, ink::BODY)\n'
+        '            .mt(px(20.))\n'
+        '            .child(tr("Play offline as (no Microsoft account needed)"));\n'
+        '        let field = div()\n'
+        '            .id("offline-name-field")\n'
+        '            .track_focus(&self.offline_name_focus)\n'
+        '            .flex()\n'
+        '            .flex_row()\n'
+        '            .items_center()\n'
+        '            .gap(px(8.))\n'
+        '            .h(px(40.))\n'
+        '            .flex_1()\n'
+        '            .px(px(12.))\n'
+        '            .rounded(px(radius::ROW))\n'
+        '            .bg(white(if focused { 0.09 } else { 0.06 }))\n'
+        '            .font_family(horizon_theme::glass::FONT)\n'
+        '            .text_size(px(14.))\n'
+        '            .text_color(white(ink::FULL))\n'
+        '            .cursor_text()\n'
+        '            .overflow_hidden()\n'
+        '            .child(\n'
+        '                div()\n'
+        '                    .flex_1()\n'
+        '                    .h_full()\n'
+        '                    .flex()\n'
+        '                    .items_center()\n'
+        '                    .overflow_hidden()\n'
+        '                    .child(line_edit::content(\n'
+        '                        &self.offline_name_input,\n'
+        '                        &t,\n'
+        '                        focused,\n'
+        '                        false,\n'
+        '                        false,\n'
+        '                        "Player",\n'
+        '                    )),\n'
+        '            )\n'
+        '            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {\n'
+        '                window.focus(&this.offline_name_focus, cx);\n'
+        '                cx.notify();\n'
+        '            }))\n'
+        '            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {\n'
+        '                match line_edit::handle(&mut this.offline_name_input, ev, cx) {\n'
+        '                    line_edit::Key::Pass => return,\n'
+        '                    line_edit::Key::Enter => {\n'
+        '                        this.save_offline_name();\n'
+        '                    }\n'
+        '                    line_edit::Key::Escape => window.blur(cx),\n'
+        '                    _ => {}\n'
+        '                }\n'
+        '                cx.stop_propagation();\n'
+        '                cx.notify();\n'
+        '            }));\n'
+        '        let field = line_edit::mouse(field, cx, |this| &mut this.offline_name_input);\n'
+        '        let dirty = self.offline_name_input.text().trim() != current.trim();\n'
+        '        let save = ui::quiet("offline-name-save", tr("Save"), 40., &t);\n'
+        '        let save = if dirty {\n'
+        '            save.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {\n'
+        '                this.save_offline_name();\n'
+        '                cx.notify();\n'
+        '            }))\n'
+        '        } else {\n'
+        '            save.opacity(0.4).cursor_default()\n'
+        '        };\n'
+        '        let row = div()\n'
+        '            .flex()\n'
+        '            .flex_row()\n'
+        '            .items_center()\n'
+        '            .gap(px(8.))\n'
+        '            .mt(px(8.))\n'
+        '            .child(field)\n'
+        '            .child(save);\n'
+        '        div().child(label).child(row)\n'
+        '    }\n'
+        '}\n'
+    )
+    if close_needle not in src:
+        return src, "missing"
+    src = src.replace(close_needle, close_replacement, 1)
+    return src, "applied"
+
+
+def patch_glass_who_plays_offline_name(src: str) -> tuple[str, str]:
+    """023: glass_account.rs -- glass_who_plays shows the offline name.
+
+    When no Microsoft account is selected, the "who plays" card shows the
+    player's offline name (from Settings) and "Offline account" as the
+    status, instead of "Sign in with Microsoft" and NEEDS_OWNER.
+    """
+    needle = (
+        '            None => (\n'
+        '                None,\n'
+        '                tr("Sign in with Microsoft").to_string(),\n'
+        '                (Tone::Off, tr(account::NEEDS_OWNER)),\n'
+        '            ),\n'
+    )
+    replacement = (
+        '            None => (\n'
+        '                None,\n'
+        '                // [horizon-offline-patch] Show the offline name the player set, not\n'
+        '                // "Sign in with Microsoft"; the status says "Offline account".\n'
+        '                self.settings.offline_name(),\n'
+        '                (Tone::Off, tr("Offline account")),\n'
+        '            ),\n'
+    )
+    if "// [horizon-offline-patch] Show the offline name" in src:
+        return src, "already"
+    if needle not in src:
+        return src, "missing"
+    return src.replace(needle, replacement, 1), "applied"
+
+
+def patch_switch_page_who_plays_offline(src: str) -> tuple[str, str]:
+    """024: switch_page.rs -- the top bar's chip shows the offline name.
+
+    When no Microsoft account is selected, the chip reads the offline name
+    and "Offline account", instead of an empty string and "Sign in with
+    Microsoft".
+    """
+    needle = (
+        '        None => (String::new(), tr("Sign in with Microsoft")),\n'
+    )
+    replacement = (
+        '        None => (\n'
+        '            // [horizon-offline-patch] Show the offline name, not an empty chip.\n'
+        '            self.settings.offline_name(),\n'
+        '            tr("Offline account"),\n'
+        '        ),\n'
+    )
+    if "// [horizon-offline-patch] Show the offline name, not an empty chip" in src:
+        return src, "already"
+    if needle not in src:
+        return src, "missing"
+    return src.replace(needle, replacement, 1), "applied"
+
+
+# ============================================================================
 # Patch registry
 # ============================================================================
 
@@ -770,6 +1255,14 @@ PATCHES: list[tuple[str, str, Callable[[str], tuple[str, str]]]] = [
     ("015-self_update-hard-guard", "launcher/src/backend.rs", patch_self_update_hard_guard),
     ("016-stage_update-hard-guard", "launcher/src/backend.rs", patch_stage_update_hard_guard),
     ("017-place_staged-hard-guard", "launcher/src/backend.rs", patch_place_staged_hard_guard),
+    # Group 5 - Offline account name (re-add what upstream removed)
+    ("018-settings-offline-name-field", "launcher/src/backend.rs", patch_settings_offline_name_field),
+    ("019-account-offline-player-fn", "launcher/src/account.rs", patch_account_offline_player_fn),
+    ("020-java-player-with-offline-fallback", "launcher/src/account.rs", patch_java_player_with_offline_fallback),
+    ("021-launcher-offline-name-state", "launcher/src/main.rs", patch_launcher_offline_name_state),
+    ("022-glass-account-offline-input", "launcher/src/glass_account.rs", patch_glass_account_offline_input),
+    ("023-glass-who-plays-offline-name", "launcher/src/glass_account.rs", patch_glass_who_plays_offline_name),
+    ("024-switch-page-who-plays-offline", "launcher/src/switch_page.rs", patch_switch_page_who_plays_offline),
 ]
 
 
