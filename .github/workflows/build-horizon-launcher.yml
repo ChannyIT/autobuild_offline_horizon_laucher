@@ -5,16 +5,14 @@ name: Build Horizon Launcher (Offline)
 #   1. Checks out THIS repo (which carries only the patch script + workflows).
 #   2. Clones horizon-rust/horizon@<ref> with --depth 1 (latest by default).
 #   3. Applies the surgical offline patches from ./horizon-offline-patch/.
-#   4. Builds `cargo build --release --locked` for Linux x86_64.
-#   5. Zips the binary (+ README) into a single .zip artifact named with the
-#      upstream commit SHA, and publishes a GitHub Release.
+#   4. Builds `cargo build --release --locked` for Linux x86_64 and Windows x64.
+#   5. Zips each platform's binary (+ deps / README) into a single .zip named
+#      `<asset>-<upstream-commit>.zip` (no zip-in-zip) and publishes a Release.
 #
-# Only Linux x86_64 is built (per the project's requirement). Online play is
-# NOT removed: a user who signs in with a Microsoft account that owns
-# Minecraft: Java Edition still gets a real session token, real skin, and
-# can join online servers. The owner gate is simply no longer required to
-# start the game, and the player can set an offline name on the Account
-# settings page.
+# Online play is NOT removed: a user who signs in with a Microsoft account that
+# owns Minecraft: Java Edition still gets a real session token, real skin, and
+# can join online servers. The owner gate is simply no longer required to start
+# the game, and the player sets an offline name on the Account settings page.
 
 on:
   workflow_dispatch:
@@ -71,6 +69,15 @@ jobs:
             binary: horizon-launcher
             asset_name: horizon-launcher-offline-linux-x86_64
             rustflags: ''
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: horizon-launcher.exe
+            asset_name: horizon-launcher-offline-windows-x86_64
+            # Match upstream's launcher.yml: statically link the C runtime so
+            # the .exe does not need the Visual C++ Redistributable on the
+            # player's machine.
+            rustflags: '-C target-feature=+crt-static'
 
     steps:
       # ─────────────────────────────────────────────────────────────────────
@@ -184,8 +191,8 @@ jobs:
       #    If it fails (e.g. no FUSE, no appimagetool), we ship the bare
       #    binary + a runtime README that lists the apt deps to install.
       #
-      #    The patch SOURCE is NOT included in the package (the player does
-      #    not need it; the patches are already applied to the binary).
+      #    The patch SOURCE is NOT packaged (the patches are already applied
+      #    to the binary; the player does not need them).
       # ─────────────────────────────────────────────────────────────────────
       - name: "7. Stage artifacts (Linux: binary + try AppImage)"
         if: runner.os == 'Linux'
@@ -230,32 +237,70 @@ jobs:
           fi
           ls -la "$STAGE"
 
-      # ─────────────────────────────────────────────────────────────────────
-      # 8. Create the .zip archive.
-      #
-      #    We use the `zip` command directly (NOT thedoctor0/zip-release)
-      #    because thedoctor0/zip-release creates the .zip INSIDE the staging
-      #    directory, then zips the directory -- so the .zip ends up inside
-      #    itself (the "zip inside a zip" bug). By creating the .zip in the
-      #    PARENT directory, it is never included in its own contents.
-      #
-      #    The filename includes the upstream horizon commit SHA (short, 7
-      #    chars) so each build is uniquely identifiable.
-      # ─────────────────────────────────────────────────────────────────────
-      - name: 8. Archive (zip, named with upstream commit SHA)
+      - name: "7b. Stage artifacts (Windows: binary + DLLs we can find + README)"
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          # The upstream horizon commit we cloned and built.
+          STAGE="${{ github.workspace }}/stage"
+          mkdir -p "$STAGE"
+
+          BIN_SRC="horizon/launcher/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [ ! -f "$BIN_SRC" ]; then
+            echo "FATAL: built binary not found at $BIN_SRC"
+            ls -la horizon/launcher/target/${{ matrix.target }}/release/ || true
+            exit 1
+          fi
+          cp "$BIN_SRC" "$STAGE/"
+
+          # Copy any sibling DLLs the linker produced (e.g. webview2loader).
+          cp horizon/launcher/target/${{ matrix.target }}/release/*.dll "$STAGE/" 2>/dev/null || true
+
+          cp horizon-offline-patch/README.md "$STAGE/OFFLINE-PATCH-README.md"
+          cp horizon/README.md "$STAGE/HORIZON-UPSTREAM-README.md" 2>/dev/null || true
+
+          ls -la "$STAGE"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # 8. Create the .zip archive.
+      #
+      #    The OLD version used thedoctor0/zip-release, which writes the .zip
+      #    INTO the staging directory and then zips that directory -- so the
+      #    .zip ended up inside itself (the "zip in a zip" bug). We now zip
+      #    directly and write the archive to the PARENT of stage/, where it
+      #    can never be included in its own contents.
+      #
+      #    The filename carries the upstream horizon commit SHA (7 chars),
+      #    e.g. horizon-launcher-offline-linux-x86_64-8933e8c.zip.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: "8. Archive (Linux: zip, named with upstream commit SHA)"
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
           UPSTREAM_SHA=$(cd horizon && git rev-parse --short=7 HEAD)
-          # The final asset name: horizon-launcher-offline-linux-x86_64-<sha>.zip
           ASSET_NAME="${{ matrix.asset_name }}-${UPSTREAM_SHA}"
           ASSET_FILE="${ASSET_NAME}.zip"
           echo "ASSET_NAME=$ASSET_NAME" >> $GITHUB_ENV
           echo "ASSET_FILE=$ASSET_FILE" >> $GITHUB_ENV
-          # Create the zip in the PARENT of stage/ so it is not inside itself.
-          (cd stage && zip -r "../$ASSET_FILE" . -x '*.git*' '*.zip')
+          # Zip the CONTENTS of stage/ into the archive at the workspace root.
+          (cd stage && zip -r "../$ASSET_FILE" .)
           ls -lh "$ASSET_FILE"
+
+      - name: "8. Archive (Windows: zip, named with upstream commit SHA)"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $upstreamSha = (git -C horizon rev-parse --short=7 HEAD).Trim()
+          $assetName = "${{ matrix.asset_name }}-$upstreamSha"
+          $assetFile = "$assetName.zip"
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSET_NAME=$assetName"
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSET_FILE=$assetFile"
+          # Compress the CONTENTS of stage/ into the archive at the workspace
+          # root (never inside stage/ -> no zip in a zip).
+          Compress-Archive -Path stage/* -DestinationPath $assetFile -Force
+          Get-Item $assetFile | Format-List Name, Length
 
       - name: 8b. Show archive info
         run: ls -lh ${{ env.ASSET_FILE }}
@@ -286,19 +331,18 @@ jobs:
 
             - **Upstream:** `horizon-rust/horizon`
             - **Ref built:** `${{ inputs.horizon_ref || 'main' }}`
-            - **Patch set:** `./horizon-offline-patch/` (27 surgical source edits: owner-gate bypass, anti-self-update hardening, offline account name re-add)
+            - **Patch set:** `./horizon-offline-patch/` (27 surgical source edits: owner-gate bypass, anti-self-update hardening, offline account name re-added)
             - **Target:** `${{ matrix.target }}`
             - **Build commit:** `${{ github.sha }}`
 
             ### What this build does
             Plays Minecraft: Java Edition **offline without a Microsoft account**,
-            on the very first run. The player sets an offline name on the
-            Account settings page (Settings → Account → "Play offline as").
-            Online play still works if you sign in with a Microsoft account
-            that owns the game.
+            on the very first run. Set your offline name on Settings → Account →
+            "Play offline as" (default: Player). Online play still works if you
+            sign in with a Microsoft account that owns the game.
 
             ### Files
-            - `${{ env.ASSET_FILE }}` — the launcher binary + README.
+            - `${{ env.ASSET_FILE }}` — the launcher binary (+ Linux AppImage when it built) + READMEs.
 
             See the in-repo `horizon-offline-patch/README.md` for the full list
             of patches and how to verify them.
@@ -319,7 +363,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Overall build job result: **${{ needs.build.result }}**" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Platform: linux-x86_64" >> $GITHUB_STEP_SUMMARY
+          echo "Each platform's status is visible in the matrix jobs above (linux-x86_64, windows-x86_64)." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Ref built: \`${{ inputs.horizon_ref || 'main' }}\`" >> $GITHUB_STEP_SUMMARY
-        shell: b
+        shell: bash
