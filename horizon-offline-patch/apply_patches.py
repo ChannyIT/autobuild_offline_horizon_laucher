@@ -749,22 +749,23 @@ def patch_place_staged_hard_guard(src: str) -> tuple[str, str]:
 # method, the `offline` field on `Accounts`, and every UI element that let a
 # player type a name and play without a Microsoft account.
 #
-# The patches above (Group 1) bypass the owner GATE so the game starts, but
-# they do NOT re-add the ability to pick an offline name. Without these
-# patches, the game starts with a name the player cannot control (and on
-# generation B, `java_player()` returns Err(NoOwner) because it calls
-# `launch()` directly, not `launch_for_game` -- the game never starts at all).
+# The patches above (Group 1) bypass the owner GATE, but they do NOT re-add
+# the ability to pick an offline name. On generation B `java_player()` calls
+# `launch()` directly (not `launch_for_game`), so without patch 020 the Java
+# game never starts at all, and the player could never choose a name.
 #
 # Group 5 closes that gap:
 #
 #   018: Settings gains an `offline_name: Option<String>` field + a helper
 #        that returns the name or "Player".
 #   019: account.rs gains `offline_player(name)` and `offline_uuid(name)`:
-#        a deterministic UUID from the name (SHA-1 based, so no new crate).
+#        a deterministic UUID from the name (SHA-1 based, no new crate).
 #   020: `java_player_with` falls back to `offline_player` when `launch()`
 #        returns NoOwner -- the game starts with the player's chosen name.
 #   021: Launcher state: `offline_name_input` (a LineEdit), focus tracking,
-#        and a `save_offline_name` method.
+#        and a `save_offline_name` method. The name is CAPTURED before the
+#        Launcher struct literal, because the struct's `settings,` field
+#        moves the local `settings` (E0382 otherwise).
 #   022: The Account settings page (glass_account.rs) gains a text input +
 #        Save button below the Microsoft card.
 #   023: `glass_who_plays` shows the offline name when no Microsoft account
@@ -934,18 +935,37 @@ def patch_java_player_with_offline_fallback(src: str) -> tuple[str, str]:
 def patch_launcher_offline_name_state(src: str) -> tuple[str, str]:
     """021: main.rs -- add offline_name LineEdit state, focus, init, save method.
 
-    Three edits in one patch:
-      a) Add the three fields (offline_name_input, offline_name_focused,
+    Five edits in one patch:
+      a) Capture the offline name BEFORE the Launcher struct literal: the
+         struct's `settings,` field (shorthand) MOVES the local `settings`,
+         and Rust evaluates struct-literal fields in source order, so a
+         `settings.offline_name()` inside the literal AFTER that field is
+         E0382 (borrow of moved value) -- the error the first version of
+         this patch hit at main.rs:704. The captured local avoids it.
+      b) Add the three fields (offline_name_input, offline_name_focused,
          offline_name_focus) to the Launcher struct, after friend_code.
-      b) Initialize them in `Launcher::new`.
-      c) Track focus in the render loop (where friend_focused is updated).
-      d) Add the `save_offline_name` method after `save_settings`.
+      c) Initialize them in `Launcher::new` from the captured local.
+      d) Track focus in the render loop (where friend_focused is updated).
+      e) Add the `save_offline_name` method after `save_settings`.
     """
     # Idempotency: if the fields are already there, skip.
     if "offline_name_input: line_edit::LineEdit" in src:
         return src, "already"
 
-    # (a) Add the fields after `friend_focus: FocusHandle,`.
+    # (a) Capture the offline name before the struct literal moves `settings`.
+    capture_needle = "        let mut settings = Settings::load();\n"
+    capture_replacement = (
+        "        let mut settings = Settings::load();\n"
+        "        // [horizon-offline-patch] The offline name, captured before the Launcher\n"
+        "        // struct below moves `settings` into its `settings` field: a use of\n"
+        "        // `settings` inside the struct literal after that would be E0382.\n"
+        "        let offline_name = settings.offline_name();\n"
+    )
+    if capture_needle not in src:
+        return src, "missing"
+    src = src.replace(capture_needle, capture_replacement, 1)
+
+    # (b) Add the fields after `friend_focus: FocusHandle,`.
     fields_needle = (
         "    friend_code: line_edit::LineEdit,\n"
         "    friend_focused: bool,\n"
@@ -964,19 +984,17 @@ def patch_launcher_offline_name_state(src: str) -> tuple[str, str]:
         return src, "missing"
     src = src.replace(fields_needle, fields_replacement, 1)
 
-    # (b) Initialize the fields in `new`.
+    # (c) Initialize the fields in `new` from the captured local (NOT from
+    #     `settings`, which the `settings,` field above already moved).
     init_needle = (
         "            friend_focus: cx.focus_handle(),\n"
         "            joining: None,\n"
     )
     init_replacement = (
         "            friend_focus: cx.focus_handle(),\n"
-        "            // [horizon-offline-patch] The offline name input.\n"
-        "            offline_name_input: line_edit::LineEdit::new(\n"
-        "                settings.offline_name(),\n"
-        "                64,\n"
-        "                32,\n"
-        "            ),\n"
+        "            // [horizon-offline-patch] The offline name input; `offline_name` was\n"
+        "            // captured before `settings` moved into this struct.\n"
+        "            offline_name_input: line_edit::LineEdit::new(offline_name, 64, 32),\n"
         "            offline_name_focused: false,\n"
         "            offline_name_focus: cx.focus_handle(),\n"
         "            joining: None,\n"
@@ -985,7 +1003,7 @@ def patch_launcher_offline_name_state(src: str) -> tuple[str, str]:
         return src, "missing"
     src = src.replace(init_needle, init_replacement, 1)
 
-    # (c) Track focus in the render loop.
+    # (d) Track focus in the render loop.
     focus_needle = "        self.friend_focused = self.friend_focus.is_focused(window);\n"
     focus_replacement = (
         "        self.friend_focused = self.friend_focus.is_focused(window);\n"
@@ -995,7 +1013,7 @@ def patch_launcher_offline_name_state(src: str) -> tuple[str, str]:
         return src, "missing"
     src = src.replace(focus_needle, focus_replacement, 1)
 
-    # (d) Add the save_offline_name method after save_settings.
+    # (e) Add the save_offline_name method after save_settings.
     save_needle = (
         "    /// Keeps the current choices in memory if writing fails; every page offers the same retry.\n"
         "    fn save_settings(&mut self) -> bool {\n"
@@ -1031,7 +1049,7 @@ def patch_launcher_offline_name_state(src: str) -> tuple[str, str]:
 def patch_glass_account_offline_input(src: str) -> tuple[str, str]:
     """022: glass_account.rs -- add the offline name input below the Microsoft card.
 
-    Two edits:
+    Three edits:
       a) In `glass_microsoft_card`, bind `offline_section` before the div chain.
       b) Append `.child(offline_section)` before the closing `}`.
       c) Add the `glass_offline_name_input` method at the end of the impl.
