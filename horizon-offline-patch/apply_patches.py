@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Horizon Launcher - Offline Patch Applier (v3, multi-upstream-version)
+Horizon Launcher - Offline Patch Applier (v4, multi-upstream-version)
 ======================================================================
 
 Turns the upstream Horizon launcher (https://github.com/horizon-rust/horizon)
@@ -28,11 +28,35 @@ generation-A needle. `--verify` reports which generation it detected, and
 fails loudly when neither matches (upstream changed again) -- a build never
 produces a silently-unpatched binary.
 
+WHY v4
+------
+The player's chosen offline name reached the launcher's own UI but NOT the
+games it starts:
+
+  - The Horizon game names its player from `--name`, `HORIZON_PLAYER_NAME`,
+    the session file, or -- with none of those -- a name it invents itself
+    ("Player01234", kept in horizon-player.txt). The launcher passed nothing
+    when offline, so every server showed that invented name instead of the
+    chosen one. v4 hands the game the chosen name (HORIZON_PLAYER_NAME) on
+    every start: single-player, LAN and servers all play under it, and a
+    signed-in account's session still wins.
+  - Java Edition's `--username` was already the chosen name, but its `--uuid`
+    was a SHA-1-derived id, NOT the MD-5 name-based UUID every offline server
+    and launcher (and the game itself) derives from the name -- splitting the
+    player's server-side identity. v4 makes it byte-for-byte vanilla, with an
+    inline MD-5 so no dependency is added and `--locked` holds.
+  - The name is now also sanitized to the game's own rule (printable ASCII,
+    up to 16 characters), so what the player sees saved is exactly what the
+    games and servers get.
+
+Trees patched by v3 are UPGRADED in place: patches 018 and 019 detect their
+older selves and replace them; re-running on a v4 tree is a no-op.
+
 WHAT THE PATCHES DO
 -------------------
-14 core patches in four groups:
+30 surgical source edits in six groups:
 
-  Group 1 - Owner gate bypass (001, 002, 003, 004, 005):
+  Group 1 - Owner gate bypass (001, 002, 002b, 003, 004, 005):
       the game starts offline without an owning Microsoft account, in the
       window, the CLI and MCP alike.
 
@@ -54,6 +78,18 @@ WHAT THE PATCHES DO
       choke point every binary replacement funnels through (AppImage, macOS
       bundle, and the plain binary whose Windows rename produces the
       "<name>.exe.old-<pid>-<n>" files).
+
+  Group 5 - Offline account name, re-added (018..024):
+      Settings gains `offline_name` (sanitized to the game's own player-name
+      rule), account.rs gains `offline_player(name)` with a vanilla offline
+      UUID, the no-owner launch falls back to it, and the Account page, the
+      "who plays" card and the top-bar chip all show and edit the name.
+
+  Group 6 - The chosen name reaches the games (025, 026, 027):
+      025 hands the Horizon game the name (HORIZON_PLAYER_NAME) on every
+      start -- the fix for "the server shows a different name"; 026 makes a
+      token-less Java launch pass `userType legacy`; 027 locks the offline
+      UUID to vanilla's own vectors in the unit tests.
 
 Online play is NOT removed: the MSA -> Xbox -> XSTS -> Minecraft chain is
 untouched, so a player who signs in with an owning account still gets a real
@@ -778,9 +814,17 @@ def patch_settings_offline_name_field(src: str) -> tuple[str, str]:
     """018: backend.rs -- Settings gains an `offline_name` field + helper.
 
     The field is `Option<String>`: None means "Player" (the game's default
-    offline name). The helper `offline_name()` returns the name or "Player".
+    offline name). The helper `offline_name()` returns the chosen name made
+    into one the game accepts -- printable ASCII, at most 16 characters, the
+    game's own rule (StringUtil.isValidPlayerName) -- or "Player". The name
+    is THE name everywhere it is used: the Account page and the top bar, the
+    game the launcher starts (HORIZON_PLAYER_NAME, patch 025), and Java
+    Edition's --username (patch 020's fallback).
+
+    v4 upgrades v3 trees in place: the old helper returned the raw typed name;
+    this one finds and replaces it, and is a no-op on a v4 tree.
     """
-    # Step 1: add the field after `owner_notice_seen`.
+    # Step 1: add the field after `owner_notice_seen` (unchanged from v3).
     field_needle = (
         "    /// The player without an account that owns the game has read, once, why the launcher needs\n"
         "    /// one now (the owner gate's screen).\n"
@@ -805,18 +849,15 @@ def patch_settings_offline_name_field(src: str) -> tuple[str, str]:
     else:
         src = src.replace(field_needle, field_replacement, 1)
 
-    # Step 2: add the helper method after `auto_install`.
+    # Step 2: the helper -- v4 text, v3 text (upgrade it), or fresh insert.
+    v4_marker = "(33..127).contains(&(*c as u32))"
     helper_needle = (
         "    /// Whether new Horizon versions are installed automatically.\n"
         "    pub fn auto_install(&self) -> bool {\n"
         "        self.install_new_versions.unwrap_or(true)\n"
         "    }\n"
     )
-    helper_replacement = (
-        "    /// Whether new Horizon versions are installed automatically.\n"
-        "    pub fn auto_install(&self) -> bool {\n"
-        "        self.install_new_versions.unwrap_or(true)\n"
-        "    }\n"
+    v3_helper = (
         "    /// [horizon-offline-patch] The name the game plays under offline (no Microsoft\n"
         "    /// account that owns the game). Returns the player's chosen name, or \"Player\"\n"
         "    /// when none is set or the name is blank.\n"
@@ -828,43 +869,63 @@ def patch_settings_offline_name_field(src: str) -> tuple[str, str]:
         "            .unwrap_or_else(|| \"Player\".to_string())\n"
         "    }\n"
     )
-    if helper_replacement in src:
-        return src, "already"
-    if helper_needle not in src:
+    v4_helper = (
+        "    /// [horizon-offline-patch] The name the game plays under offline (no Microsoft\n"
+        "    /// account that owns the game): the player's chosen name, made into one the\n"
+        "    /// game accepts -- printable ASCII, at most 16 of them, exactly the game's own\n"
+        "    /// rule for a player name -- or \"Player\" when none is set or nothing valid is\n"
+        "    /// left. This one name is used everywhere: the Account page and the top bar,\n"
+        "    /// the game the launcher starts (HORIZON_PLAYER_NAME), and Java Edition's\n"
+        "    /// --username.\n"
+        "    pub fn offline_name(&self) -> String {\n"
+        "        self.offline_name\n"
+        "            .as_deref()\n"
+        "            .map(str::trim)\n"
+        "            .map(|n| {\n"
+        "                n.chars()\n"
+        "                    .filter(|c| (33..127).contains(&(*c as u32)))\n"
+        "                    .take(16)\n"
+        "                    .collect::<String>()\n"
+        "            })\n"
+        "            .filter(|n| !n.is_empty())\n"
+        "            .unwrap_or_else(|| \"Player\".to_string())\n"
+        "    }\n"
+    )
+    if v4_marker in src:
+        status = "already"
+    elif v3_helper in src:
+        src = src.replace(v3_helper, v4_helper, 1)
+        status = "applied"
+    elif helper_needle in src:
+        src = src.replace(helper_needle, helper_needle + v4_helper, 1)
+        status = "applied"
+    else:
         return src, "missing"
-    src = src.replace(helper_needle, helper_replacement, 1)
-    return src, "applied"
+    return src, status
 
 
 def patch_account_offline_player_fn(src: str) -> tuple[str, str]:
-    """019: account.rs -- add `offline_player(name)` and `offline_uuid(name)`.
+    """019: account.rs -- offline_player(name) + a vanilla offline UUID (MD-5).
 
     `offline_player` builds a `java_launch::Player` with the given name, a
-    deterministic UUID derived from it, no token, and no xuid. The game
-    starts offline with this player when no Microsoft account owns the game.
+    deterministic UUID derived from it, no token, and no xuid.
 
-    `offline_uuid` hashes `b"OfflinePlayer:" + name` with SHA-1 (the crate
-    the launcher already depends on), takes the first 16 bytes, and sets
-    the version (3, name-based) and variant (IETF) bits. The result is a
-    valid UUID v3 that is stable per name (single-player saves stick).
+    `offline_uuid` is byte-for-byte the UUID Mojang's game derives for an
+    offline player (java.util.UUID.nameUUIDFromBytes over b"OfflinePlayer:" +
+    name): an MD-5 digest, the version set to 3 (name-based) and the variant
+    to IETF. v3 used SHA-1 with the same bits -- stable per name, but a
+    DIFFERENT id than the one every offline server, the game itself and every
+    other offline launcher derive for that name, splitting the player's
+    server-side identity. v4 replaces it; v3-patched trees are upgraded in
+    place (the SHA-1 block is found and swapped).
+
+    `md5` is MD-5 (RFC 1321) written out in full: the launcher depends on no
+    MD-5 crate, and this keeps the build exactly on the upstream Cargo.lock
+    (`cargo build --locked`). The algorithm was verified against RFC 1321's
+    own test vectors and random inputs across block boundaries.
     """
-    # The needle is the start of `java_player_with`; we insert the two new
-    # functions right before it.
-    needle = "fn java_player_with(\n"
-    replacement = (
-        "/// [horizon-offline-patch] An offline player: the name the player chose\n"
-        "/// (Settings' `offline_name`, or \"Player\"), a deterministic UUID derived from\n"
-        "/// it, and no token. The game starts offline with this player when no Microsoft\n"
-        "/// account that owns the game is signed in.\n"
-        "pub fn offline_player(name: &str) -> crate::java_launch::Player {\n"
-        "    crate::java_launch::Player {\n"
-        "        name: name.to_string(),\n"
-        "        uuid: offline_uuid(name),\n"
-        "        token: String::new(),\n"
-        "        xuid: String::new(),\n"
-        "    }\n"
-        "}\n"
-        "\n"
+    # What v3 wrote; replaced by the MD-5 version below on upgrade.
+    v3_uuid_block = (
         "/// [horizon-offline-patch] A deterministic UUID from a player name, the way\n"
         "/// Mojang's game derives its offline UUIDs: a type-3 (name-based) UUID. Mojang\n"
         "/// uses MD-5; we use SHA-1 (the crate the launcher already depends on for\n"
@@ -889,15 +950,130 @@ def patch_account_offline_player_fn(src: str) -> tuple[str, str]:
         "        bytes[12], bytes[13], bytes[14], bytes[15]\n"
         "    )\n"
         "}\n"
-        "\n"
-        "fn java_player_with(\n"
     )
-    # Idempotency: if the new function is already there, skip.
-    if "pub fn offline_player(name: &str) -> crate::java_launch::Player {" in src:
+    # The v4 offline_uuid (vanilla MD-5 name-based) plus the inline md5().
+    uuid_and_md5 = (
+        "/// [horizon-offline-patch] The offline UUID of a player name, byte for byte the\n"
+        "/// way Mojang's game makes its own offline one (java.util.UUID.nameUUIDFromBytes\n"
+        "/// over b\"OfflinePlayer:\" + name): an MD-5 digest, then the version set to 3\n"
+        "/// (name-based) and the variant to IETF. A server that knows the player only by\n"
+        "/// name finds exactly this UUID -- its whitelist, permissions, skins and\n"
+        "/// user-cache rows -- so the player keeps one identity here, in the game's own\n"
+        "/// offline mode, and with every other offline launcher alike.\n"
+        "fn offline_uuid(name: &str) -> String {\n"
+        "    let mut bytes = md5(format!(\"OfflinePlayer:{name}\").as_bytes());\n"
+        "    // Set the version (3, name-based) and variant (IETF) bits.\n"
+        "    bytes[6] = (bytes[6] & 0x0F) | 0x30;\n"
+        "    bytes[8] = (bytes[8] & 0x3F) | 0x80;\n"
+        "    format!(\n"
+        "        \"{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\",\n"
+        "        bytes[0], bytes[1], bytes[2], bytes[3],\n"
+        "        bytes[4], bytes[5], bytes[6], bytes[7],\n"
+        "        bytes[8], bytes[9], bytes[10], bytes[11],\n"
+        "        bytes[12], bytes[13], bytes[14], bytes[15]\n"
+        "    )\n"
+        "}\n"
+        "\n"
+        "/// [horizon-offline-patch] MD-5 (RFC 1321), the hash Mojang's offline UUIDs are\n"
+        "/// made of. Written out in full -- the launcher depends on no MD-5 crate, and\n"
+        "/// this keeps the build exactly on the upstream Cargo.lock (`--locked`).\n"
+        "fn md5(input: &[u8]) -> [u8; 16] {\n"
+        "    // RFC 1321's per-round shift amounts and its table of floor(abs(sin(i)) * 2^32).\n"
+        "    const S: [u32; 64] = [\n"
+        "        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,\n"
+        "        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,\n"
+        "        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,\n"
+        "        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,\n"
+        "    ];\n"
+        "    const K: [u32; 64] = [\n"
+        "        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,\n"
+        "        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,\n"
+        "        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,\n"
+        "        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,\n"
+        "        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,\n"
+        "        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,\n"
+        "        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,\n"
+        "        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,\n"
+        "    ];\n"
+        "    let (mut a0, mut b0, mut c0, mut d0) =\n"
+        "        (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);\n"
+        "    // The message, padded: one 0x80 byte, zeros to 56 mod 64, the bit length.\n"
+        "    let mut message = input.to_vec();\n"
+        "    let bits = (input.len() as u64).wrapping_mul(8);\n"
+        "    message.push(0x80);\n"
+        "    while message.len() % 64 != 56 {\n"
+        "        message.push(0);\n"
+        "    }\n"
+        "    message.extend_from_slice(&bits.to_le_bytes());\n"
+        "    for chunk in message.chunks_exact(64) {\n"
+        "        let mut m = [0u32; 16];\n"
+        "        for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {\n"
+        "            *word = u32::from_le_bytes(bytes.try_into().unwrap());\n"
+        "        }\n"
+        "        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);\n"
+        "        for i in 0..64 {\n"
+        "            let (f, g) = match i / 16 {\n"
+        "                0 => ((b & c) | (!b & d), i),\n"
+        "                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),\n"
+        "                2 => (b ^ c ^ d, (3 * i + 5) % 16),\n"
+        "                _ => (c ^ (b | !d), (7 * i) % 16),\n"
+        "            };\n"
+        "            // One round: A + F + K[i] + M[g], rotated, added into B;\n"
+        "            // A, B, C and D then rotate their places.\n"
+        "            let sum = a\n"
+        "                .wrapping_add(f)\n"
+        "                .wrapping_add(K[i])\n"
+        "                .wrapping_add(m[g])\n"
+        "                .rotate_left(S[i]);\n"
+        "            a = d;\n"
+        "            d = c;\n"
+        "            c = b;\n"
+        "            b = b.wrapping_add(sum);\n"
+        "        }\n"
+        "        a0 = a0.wrapping_add(a);\n"
+        "        b0 = b0.wrapping_add(b);\n"
+        "        c0 = c0.wrapping_add(c);\n"
+        "        d0 = d0.wrapping_add(d);\n"
+        "    }\n"
+        "    let mut out = [0u8; 16];\n"
+        "    out[0..4].copy_from_slice(&a0.to_le_bytes());\n"
+        "    out[4..8].copy_from_slice(&b0.to_le_bytes());\n"
+        "    out[8..12].copy_from_slice(&c0.to_le_bytes());\n"
+        "    out[12..16].copy_from_slice(&d0.to_le_bytes());\n"
+        "    out\n"
+        "}\n"
+    )
+    # offline_player itself (identical to v3; kept so a fresh insert and an
+    # upgrade produce the same layout).
+    offline_player_block = (
+        "/// [horizon-offline-patch] An offline player: the name the player chose\n"
+        "/// (Settings' `offline_name`, or \"Player\"), a deterministic UUID derived from\n"
+        "/// it, and no token. The game starts offline with this player when no Microsoft\n"
+        "/// account that owns the game is signed in.\n"
+        "pub fn offline_player(name: &str) -> crate::java_launch::Player {\n"
+        "    crate::java_launch::Player {\n"
+        "        name: name.to_string(),\n"
+        "        uuid: offline_uuid(name),\n"
+        "        token: String::new(),\n"
+        "        xuid: String::new(),\n"
+        "    }\n"
+        "}\n"
+        "\n"
+    )
+    # Upgraded already (the md5 helper is only ever written by v4)?
+    if "fn md5(input: &[u8]) -> [u8; 16] {" in src:
         return src, "already"
+    # A v3-patched tree: swap the SHA-1 offline_uuid for the vanilla MD-5 one.
+    if v3_uuid_block in src:
+        return src.replace(v3_uuid_block, uuid_and_md5, 1), "applied"
+    # A state with offline_player but neither UUID version: fail loudly.
+    if "pub fn offline_player(name: &str) -> crate::java_launch::Player {" in src:
+        return src, "missing"
+    # A fresh upstream tree: insert both functions right before java_player_with.
+    needle = "fn java_player_with(\n"
     if needle not in src:
         return src, "missing"
-    return src.replace(needle, replacement, 1), "applied"
+    return src.replace(needle, offline_player_block + uuid_and_md5 + "\n" + needle, 1), "applied"
 
 
 def patch_java_player_with_offline_fallback(src: str) -> tuple[str, str]:
@@ -1244,6 +1420,134 @@ def patch_switch_page_who_plays_offline(src: str) -> tuple[str, str]:
 
 
 # ============================================================================
+# Group 6 - The chosen name reaches the games (the server-name fix)
+# ============================================================================
+
+
+def patch_client_command_player_name(src: str) -> tuple[str, str]:
+    """025: backend.rs -- client_command() hands the game the offline name.
+
+    THE fix for "the server shows a different name". The Horizon game names
+    its player from `--name`, `HORIZON_PLAYER_NAME`, the session file, or --
+    with none of those -- a name it invents itself ("Player01234", kept in
+    horizon-player.txt; crates/horizon-client/src/offline_name.rs). It uses
+    that name for single-player, for LAN worlds and for every server it
+    joins, and derives its offline UUID from it. The launcher handed over
+    nothing when no Microsoft account was signed in, so every server saw the
+    game's invented name instead of the player's chosen one.
+
+    client_command() is the single choke point every game start goes through
+    (the window's Play, the CLI, the MCP server's play, quick play, a
+    friend's Join). HORIZON_PLAYER_NAME is chosen over `--name` because the
+    game reads it exactly the same way (launch_options.rs seeds player_name
+    from it) while a command-line option can be refused outright (exit code
+    2) by a build that no longer knows it; an environment variable no build
+    rejects can only be ignored. A session file still wins -- the game sets
+    player_name from it after reading it -- so a signed-in account keeps its
+    own name, UUID, skin and online servers.
+    """
+    needle = (
+        "        .arg(\"--resources\")\n"
+        "        .arg(resources(tag));\n"
+        "    // How the game asks for a renewed session (`account session`) while it runs.\n"
+    )
+    replacement = (
+        "        .arg(\"--resources\")\n"
+        "        .arg(resources(tag));\n"
+        "    // [horizon-offline-patch] The name the game plays under when no Microsoft account\n"
+        "    // hands over a session: the player's chosen offline name. The game reads\n"
+        "    // HORIZON_PLAYER_NAME exactly as its `--name`, for the player name it plays\n"
+        "    // single-player, LAN and servers under (its offline UUID follows from it);\n"
+        "    // a session file still wins, so a signed-in account keeps its own name.\n"
+        "    // Without this the game invents a name of its own (\"Player01234\", kept in\n"
+        "    // horizon-player.txt) and every server shows that one instead.\n"
+        "    cmd.env(\"HORIZON_PLAYER_NAME\", Settings::load().offline_name());\n"
+        "    // How the game asks for a renewed session (`account session`) while it runs.\n"
+    )
+    if 'cmd.env("HORIZON_PLAYER_NAME", Settings::load().offline_name());' in src:
+        return src, "already"
+    if needle not in src:
+        return src, "missing"
+    return src.replace(needle, replacement, 1), "applied"
+
+
+def patch_java_user_type_offline(src: str) -> tuple[str, str]:
+    """026: java_launch.rs -- a token-less player passes userType legacy.
+
+    The Java command line's ${user_type} was hardcoded to "msa". A player
+    with no session token is not an msa user; every offline launcher passes
+    "legacy" for them, and old versions (which still expand ${user_type})
+    treat it as the offline/legacy account type. A signed-in account keeps
+    "msa".
+    """
+    needle = (
+        "        (\"clientid\", String::new()),\n"
+        "        (\"user_type\", \"msa\".into()),\n"
+    )
+    replacement = (
+        "        (\"clientid\", String::new()),\n"
+        "        // [horizon-offline-patch] A player with no session token is not an msa\n"
+        "        // user: pass legacy, as offline launchers do. A signed-in account keeps msa.\n"
+        "        (\n"
+        "            \"user_type\",\n"
+        "            if p.token.is_empty() { \"legacy\" } else { \"msa\" }.into(),\n"
+        "        ),\n"
+    )
+    if "// [horizon-offline-patch] A player with no session token is not an msa" in src:
+        return src, "already"
+    if needle not in src:
+        return src, "missing"
+    return src.replace(needle, replacement, 1), "applied"
+
+
+def patch_offline_uuid_tests(src: str) -> tuple[str, str]:
+    """027: account/tests.rs -- the offline UUID is vanilla's own, locked in.
+
+    The vectors are java.util.UUID.nameUUIDFromBytes(b"OfflinePlayer:" + name)
+    precomputed (MD-5, version 3, IETF variant) -- the same id the Horizon
+    game itself derives (horizon_protocol::crypto::offline_uuid) and every
+    offline server derives for a name. If a future edit to offline_uuid
+    drifts from vanilla, these fail instead of silently splitting the
+    player's server-side identity. Also pins offline_player itself: the
+    chosen name, the matching UUID, and no token.
+    """
+    needle = (
+        "//! The sign-in chain against a local mock of the Microsoft, Xbox Live and Minecraft endpoints\n"
+        "//! (recorded response shapes, mock tokens only), and the keychain abstraction in memory.\n"
+        "use super::*;\n"
+    )
+    replacement = (
+        "//! The sign-in chain against a local mock of the Microsoft, Xbox Live and Minecraft endpoints\n"
+        "//! (recorded response shapes, mock tokens only), and the keychain abstraction in memory.\n"
+        "use super::*;\n"
+        "\n"
+        "// [horizon-offline-patch] The offline player: vanilla's own offline UUID (MD-5,\n"
+        "// name-based, type 3 -- java.util.UUID.nameUUIDFromBytes over\n"
+        "// b\"OfflinePlayer:\" + name), the chosen name, and no token.\n"
+        "#[test]\n"
+        "fn offline_uuids_are_the_games_own_name_based_ones() {\n"
+        "    assert_eq!(offline_uuid(\"Notch\"), \"b50ad385-829d-3141-a216-7e7d7539ba7f\");\n"
+        "    assert_eq!(offline_uuid(\"Player\"), \"a01e3843-e521-3998-958a-f459800e4d11\");\n"
+        "    assert_eq!(offline_uuid(\"Builder_1\"), \"0f752bb2-550f-36e1-873e-a6d543ec5abe\");\n"
+        "}\n"
+        "\n"
+        "#[test]\n"
+        "fn the_offline_player_plays_under_its_name_with_no_token() {\n"
+        "    let player = offline_player(\"Builder_1\");\n"
+        "    assert_eq!(player.name, \"Builder_1\");\n"
+        "    assert_eq!(player.uuid, offline_uuid(\"Builder_1\"));\n"
+        "    assert_eq!(player.token, \"\");\n"
+        "    assert_eq!(player.xuid, \"\");\n"
+        "}\n"
+    )
+    if "fn offline_uuids_are_the_games_own_name_based_ones() {" in src:
+        return src, "already"
+    if needle not in src:
+        return src, "missing"
+    return src.replace(needle, replacement, 1), "applied"
+
+
+# ============================================================================
 # Patch registry
 # ============================================================================
 
@@ -1281,6 +1585,10 @@ PATCHES: list[tuple[str, str, Callable[[str], tuple[str, str]]]] = [
     ("022-glass-account-offline-input", "launcher/src/glass_account.rs", patch_glass_account_offline_input),
     ("023-glass-who-plays-offline-name", "launcher/src/glass_account.rs", patch_glass_who_plays_offline_name),
     ("024-switch-page-who-plays-offline", "launcher/src/switch_page.rs", patch_switch_page_who_plays_offline),
+    # Group 6 - The chosen name reaches the games (the server-name fix)
+    ("025-client-command-offline-name", "launcher/src/backend.rs", patch_client_command_player_name),
+    ("026-java-user-type-offline", "launcher/src/java_launch.rs", patch_java_user_type_offline),
+    ("027-offline-uuid-vanilla-tests", "launcher/src/account/tests.rs", patch_offline_uuid_tests),
 ]
 
 
